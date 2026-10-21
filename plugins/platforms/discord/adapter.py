@@ -2550,13 +2550,20 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             logger.warning("[%s] Missed-message backfill failed: %s", self.name, exc, exc_info=True)
 
     def _in_bot_thread(self, message: Any) -> bool:
-        """Thread the bot already joined skips the mention check — unless
-        thread_require_mention (multi-bot threads) gates threads like channels."""
-        return (
-            isinstance(message.channel, discord.Thread)
-            and str(message.channel.id) in self._threads
-            and not self._discord_thread_require_mention()
-        )
+        """Thread the bot already joined skips the mention check, but only while the
+        thread or its parent channel is mention-free — a thread hanging off a normal
+        channel keeps the @mention requirement. ``thread_require_mention`` (multi-bot
+        threads) gates threads like channels and wins over both."""
+        if not isinstance(message.channel, discord.Thread):
+            return False
+        if self._discord_thread_require_mention():
+            return False
+        if str(message.channel.id) not in self._threads:
+            return False
+        free_channels = self._discord_free_response_channels()
+        if "*" in free_channels:
+            return True
+        return bool(self._discord_channel_keys_from_channel(message.channel) & free_channels)
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
