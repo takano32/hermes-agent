@@ -355,7 +355,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     def _make_bg_review_callbacks(self):
         """(send, release): background-review messages ("💾 Memory updated") are held until the
         adapter's post-delivery hook releases them after the main response lands."""
-        from gateway.run import _interim_metadata, _non_conversational_metadata
+        from gateway.run import _interim_metadata, _non_conversational_metadata, _platform_config_key
+        from gateway.display_config import resolve_display_setting
         ctx = self._ctx
         release_evt = threading.Event()
         pending: list[str] = []
@@ -373,6 +374,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 live = authority.sessions.get(session_id)
                 if live is not None:
                     live.event_stream.publish(session_id, {"text": str(message)}, event_type="review.summary")
+                return
+            # zerozari00 patch (T9-1): per-platform memory_notifications "off" suppresses ONLY
+            # this chat delivery of the background-review summary. The review itself, its actions
+            # and the stdout log line keep running, so a log-based relay still sees the summary.
+            try:
+                _mn = str(resolve_display_setting(
+                    ctx.user_config, _platform_config_key(ctx.source.platform), "memory_notifications"
+                ) or "on").lower()
+            except Exception:
+                _mn = "on"
+            if _mn == "off":
                 return
             if self._status_live():
                 self._send_status_text(

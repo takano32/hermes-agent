@@ -978,6 +978,20 @@ class GatewayTurnProgressMixin:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
+    def _diagnostic_chat_id(self):
+        """Diagnostics (warn/DiagnosticText) go to platforms.<platform>.diagnostic_chat_id.
+
+        The lifecycle rail otherwise posts into whatever chat the turn runs in, so a
+        model-fallback notice lands in every channel the bot talks in. An operator can
+        pin those to one ops channel; unset = keep current behaviour.
+        """
+        ctx = self._ctx
+        platform = getattr(ctx.source.platform, "value", ctx.source.platform)
+        cfg = ctx.user_config if isinstance(ctx.user_config, dict) else {}
+        plat_cfg = (cfg.get("platforms") or {}).get(platform) or {}
+        target = plat_cfg.get("diagnostic_chat_id") if isinstance(plat_cfg, dict) else None
+        return str(target) if target else None
+
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
         from gateway.warning_notifications import is_warning_status, render_notification
@@ -992,19 +1006,27 @@ class GatewayTurnProgressMixin:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
+        diagnostic = is_warning_status(event_type, message)
+        chat_id, thread_metadata = ctx._status_chat_id, ctx._status_thread_metadata
+        if diagnostic:
+            target_chat_id = self._diagnostic_chat_id()
+            if target_chat_id and target_chat_id != str(chat_id):
+                # Diagnostics are operational noise for the chat that happened to run the
+                # turn; the operator asked for them in one place only.
+                chat_id, thread_metadata = target_chat_id, None
         def present():
             if local_viewer_turn(self):
                 self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, prepared),
                                                           "text": prepared})
                 return
             fut = self._schedule(
-                _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                _send_or_update_status_coro(ctx._status_adapter, chat_id, event_type, prepared, thread_metadata),
                 f"status_callback ({event_type}) scheduling error",
             )
             if fut is not None and ctx._cleanup_progress:
                 fut.add_done_callback(self._track_future_cleanup_id)
         render_notification(present, platform=ctx.source.platform, user_config=ctx.user_config,
-                            diagnostic=is_warning_status(event_type, message))
+                            diagnostic=diagnostic)
 
 
 def local_viewer_turn(runner) -> bool:
