@@ -5133,13 +5133,35 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         content = getattr(message, "content", "") or ""
         return {match.group(1) for match in re.finditer(r"<@!?(\d+)>", content)}
 
+    def _raw_mentioned_role_ids(self, message: Any) -> set:
+        """Extract role-mention IDs (``<@&ID>``) from raw content."""
+        content = getattr(message, "content", "") or ""
+        return {match.group(1) for match in re.finditer(r"<@&(\d+)>", content)}
+
+    def _self_holds_mentioned_role(self, message: Any) -> bool:
+        """True when a mentioned role is one this bot itself holds (``@AI`` etc.)."""
+        mentioned = {
+            str(role.id) for role in (getattr(message, "role_mentions", None) or [])
+        } | self._raw_mentioned_role_ids(message)
+        if not mentioned:
+            return False
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return False
+        me = getattr(guild, "me", None) or guild.get_member(self._client.user.id)
+        own_roles = {str(role.id) for role in (getattr(me, "roles", None) or [])}
+        return bool(mentioned & own_roles)
+
     def _self_is_explicitly_mentioned(self, message: Any) -> bool:
-        """True when the bot is in ``message.mentions`` or raw-mentioned in the content."""
+        """True when the bot is in ``message.mentions``, raw-mentioned in the content,
+        or a role it holds is mentioned (``@role``)."""
         if not self._client or not self._client.user:
             return False
         if self._client.user in getattr(message, "mentions", []):
             return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        return self._self_holds_mentioned_role(message)
 
     def _self_is_raw_mentioned(self, message: Any) -> bool:
         """True only for a literal ``<@bot>`` token: reply-pings add us to ``message.mentions``
