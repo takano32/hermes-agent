@@ -1695,6 +1695,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
+                and not self._self_is_replied_to(message)
                 and not bot_tag_continuation
             ):
                 return False, False
@@ -5169,6 +5170,26 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if not self._client or not self._client.user:
             return False
         return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+
+    def _self_is_replied_to(self, message: Any) -> bool:
+        """True when the message is a Discord reply to one of our own messages.
+
+        Bots usually answer by hitting Reply instead of typing an inline ``<@id>``
+        token, and Discord puts the replied-to author in ``message.mentions``
+        without adding one — so a plain reply would otherwise be dropped by the
+        inline-mention gate and the conversation silently dies.
+        """
+        if not self._client or not self._client.user:
+            return False
+        reference = getattr(message, "reference", None)
+        if reference is None or getattr(reference, "message_id", None) is None:
+            return False
+        resolved = getattr(reference, "resolved", None)
+        if resolved is not None:
+            author = getattr(resolved, "author", None)
+            if author is not None:
+                return getattr(author, "id", None) == self._client.user.id
+        return self._client.user in (getattr(message, "mentions", None) or [])
 
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
