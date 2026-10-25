@@ -83,6 +83,11 @@ class _Snowflake:
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
+# Hard ceiling for one persistent typing loop. The loop is normally cancelled by stop_typing()
+# at turn end; this bounds the blast radius when a stop is missed (zerozari00, 2026-10-25: a
+# cancelled loop's unconditional map pop orphaned its replacement, so a thread showed
+# "typing…" indefinitely after the turn finished).
+_TYPING_LOOP_MAX_SECONDS = 3600
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
@@ -1285,6 +1290,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._semantic_thread_renames = SemanticThreadRenames()
         # Persistent typing loops per channel (DMs don't reliably show bot typing events).
         self._typing_tasks: dict[str, asyncio.Task] = {}
+        # Per-chat generation counter: stop_typing() bumps it so ANY loop still alive for that
+        # chat (including one orphaned by a lost map entry) exits on its next tick instead of
+        # posting "typing…" forever (zerozari00, 2026-10-25).
+        self._typing_epoch: dict[str, int] = {}
         self._bot_task: Optional[asyncio.Task] = None
         # Background task that runs post-connect housekeeping (command-menu registration + DM-topic setup)
         # off the connect path so a slow Bot API call (e.g. a set_my_commands stall for certain tokens)
@@ -4345,8 +4354,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             return
 
         async def _typing_loop() -> None:
+            _started = asyncio.get_running_loop().time()
+            _epoch = self._typing_epoch.get(chat_id, 0)
             try:
                 while True:
+                    if self._typing_epoch.get(chat_id, 0) != _epoch:
+                        return  # a stop_typing() superseded this loop
                     try:
                         route = discord.http.Route(
                             "POST", "/channels/{channel_id}/typing", channel_id=chat_id,
@@ -4367,14 +4380,29 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         await asyncio.sleep(retry_after)
                         continue
                     await asyncio.sleep(12)
+                    if asyncio.get_running_loop().time() - _started > _TYPING_LOOP_MAX_SECONDS:
+                        logger.warning(
+                            "Discord typing loop for %s ran %ss without a stop; ending it "
+                            "(a turn-end stop_typing() was missed)",
+                            chat_id, _TYPING_LOOP_MAX_SECONDS,
+                        )
+                        return
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                # Drop ONLY our own entry. The old unconditional pop let a late-firing cancelled
+                # loop delete its replacement's map entry, orphaning that task: it kept posting
+                # every 12s after the turn ended and no stop_typing could reach it any more.
+                if self._typing_tasks.get(chat_id) is asyncio.current_task():
+                    self._typing_tasks.pop(chat_id, None)
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
     async def stop_typing(self, chat_id: str) -> None:
         """Stop the persistent typing indicator for a channel."""
+        # Supersede every loop for this chat first: even a loop whose map entry was lost keeps
+        # a private epoch and exits on its next tick (≤12 s), so "typing…" cannot outlive the
+        # turn (zerozari00, 2026-10-25).
+        self._typing_epoch[chat_id] = self._typing_epoch.get(chat_id, 0) + 1
         task = self._typing_tasks.pop(chat_id, None)
         if task:
             task.cancel()
