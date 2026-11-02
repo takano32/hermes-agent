@@ -5759,6 +5759,18 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     )
             return send_kwargs, view
         result = await self._send_prompt(prompt.chat_id, prompt.metadata, _build)
+        # One INFO line per prompt so an out-of-process relay (watch.bash) can mirror it into
+        # the management channel: the prompt itself is only a Discord card, so nothing else
+        # in the log proves it was sent (measured 2026-11-02: gateway.log had only the later
+        # "button resolved" line, so the relay had nothing to match).
+        if result.success:
+            try:
+                logger.info(
+                    "discord: approval prompt sent chat=%s session=%s smart_denied=%s",
+                    prompt.chat_id, prompt.session_key, bool(getattr(prompt, "smart_denied", False)),
+                )
+            except Exception:  # a log line must never break the prompt
+                pass
         if result.success and view.pending_retire:
             await view.retire(view.pending_retire)
         return result
