@@ -14,17 +14,41 @@ def _fmt_state(subsystem: str) -> str:
     return f"{subsystem}.write_approval = {'on' if on else 'off'}"
 
 
+# Chat output must stay readable: a review backlog of 50 entries used to render
+# ~33k characters (payloads include entire memory paragraphs). Show a capped
+# preview instead; the id is what approve/reject needs, and the full text is
+# still on disk for `_matched_entries` callers.
+_PREVIEW_MAX_ENTRIES = 10
+_PREVIEW_SUMMARY_CHARS = 90
+_PREVIEW_ENTRY_CHARS = 90
+
+
+def _clip(text, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
 def _fmt_pending_list(subsystem: str) -> str:
     records = wa.list_pending(subsystem)
     if not records:
         return f"No pending {subsystem} writes."
+    shown = records[:_PREVIEW_MAX_ENTRIES]
     lines = [f"Pending {subsystem} writes ({len(records)}):"]
-    for r in records:
+    for r in shown:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
-        lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
+        lines.append(f"  {r['id']}{tag}  {_clip(r.get('summary', ''), _PREVIEW_SUMMARY_CHARS)}")
         if subsystem == wa.MEMORY:
-            lines.extend(f"      {line}" for line in _matched_entries(r["payload"]))
+            entries = _matched_entries(r["payload"])
+            if entries:
+                lines.append(f"      {_clip(entries[0], _PREVIEW_ENTRY_CHARS)}")
+                if len(entries) > 1:
+                    lines.append(f"      \u2026 +{len(entries) - 1} more entr{'y' if len(entries) == 2 else 'ies'}")
+    if len(records) > len(shown):
+        lines.append(
+            f"  \u2026 {len(records) - len(shown)} more not shown"
+            f" (approve|reject all applies to every one)"
+        )
     lines.append("")
     lines.append(f"Apply: /{subsystem} approve <id>   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
