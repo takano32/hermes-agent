@@ -230,6 +230,18 @@ class GatewayTurnPersistenceMixin:
             _show_reasoning_effective = (
                 False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
             )
+        # 本文側の推論ブロックだけを止める口（既定 true）。show_reasoning は推論デルタを
+        # 流すかどうかも兼ねているため、ライブ表示を活かしたまま本文だけ消せない。
+        # display.platforms.<p>.reasoning_block: false で本文側だけ落とす（2026-11-11）。
+        try:
+            _reasoning_block = _resolve_gateway_display_bool(
+                _load_gateway_config(), _platform_config_key(source.platform), "reasoning_block",
+                default=True, platform=source.platform,
+            )
+        except Exception:
+            _reasoning_block = True
+        if not _reasoning_block:
+            return response
         last_reasoning = agent_result.get("last_reasoning")
         if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
             return response
