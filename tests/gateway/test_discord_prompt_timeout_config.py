@@ -4,6 +4,11 @@ ExecApprovalView, SlashConfirmView, UpdatePromptView, and ClarifyChoiceView read
 ``approvals.discord_prompt_timeout`` with the same 300s default, clamped to
 ``[_DISCORD_PROMPT_TIMEOUT_MIN, _DISCORD_PROMPT_TIMEOUT_MAX]`` so a typo
 can't make prompts disappear or exceed the shared platform-safe timeout cap.
+
+The exec-approval card is the exception: it carries a request id, so the approval
+waiter's settle observer retires it, and the waiter's own deadline (extendable from
+the card's 延長 button) is what expires it. Its view timeout is therefore ``None``
+when it has a request id, and only a request-id-less card falls back to this timeout.
 """
 
 import sys
@@ -103,14 +108,18 @@ async def test_all_prompt_types_use_owning_profile_discord_timeout(tmp_path):
         )
         token = set_hermes_home_override(str(home))
         try:
-            views = [
-                ExecApprovalView("session", set(), request_id="request"),
+            exec_view = ExecApprovalView("session", set(), request_id="request")
+            legacy = [
                 SlashConfirmView("session", "confirm", set()),
                 UpdatePromptView("session", set()),
                 ClarifyChoiceView(["yes"], "clarify", set()),
             ]
-            assert [view.timeout for view in views] == [expected] * 4
-            for view in views:
+            # The exec card parks the turn on the waiter's deadline, not on a view timeout the user
+            # cannot see; without a request id it has no settle observer, so it keeps the timed view.
+            assert exec_view.timeout is None
+            assert ExecApprovalView("session", set()).timeout == expected
+            assert [view.timeout for view in legacy] == [expected] * 3
+            for view in [exec_view, *legacy]:
                 view.stop()
         finally:
             reset_hermes_home_override(token)

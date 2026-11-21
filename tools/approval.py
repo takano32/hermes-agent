@@ -17,6 +17,7 @@ import importlib
 import logging
 import os
 import threading
+import time
 from typing import Any, Iterable, Optional
 
 from utils import env_var_enabled, is_truthy_value
@@ -234,6 +235,45 @@ def resolve_gateway_approval_card(session_key: str, choice: str, request_id: Opt
                               admitted=admitted):
                 return 0
         return resolve_gateway_approval(session_key, choice, request_id=request_id)
+
+
+_APPROVAL_EXTEND_MAX_TAPS = 8
+
+
+def extend_gateway_approval(session_key: str, request_id: Optional[str], seconds: int = 0) -> int:
+    """Push one pending approval's deadline further out and let the waiter see it mid-wait.
+
+    The wait side re-reads ``entry.deadline`` on every poll slice, so this takes effect immediately:
+    a card's "extend" button can keep a turn parked without editing ``approvals.timeout`` for every
+    future prompt. *seconds* defaults to the request's own captured timeout. Capped at
+    ``_APPROVAL_EXTEND_MAX_TAPS`` taps so a card nobody answers cannot park a turn indefinitely.
+
+    Returns 1 when a wait was extended, 0 when the request already settled, the cap is hit, or the
+    id is unknown — so a tap on a dead card still reports "no longer pending" instead of success.
+    """
+    if not request_id:
+        return 0
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return 0
+    with _lock:
+        entry = _entry_for_request(session_key, request_id)
+        if entry is None or entry.deadline is None:
+            return 0
+        if entry.extend_count >= _APPROVAL_EXTEND_MAX_TAPS:
+            return 0
+        if seconds <= 0:
+            try:
+                seconds = int(entry.data.get("timeout_s") or approval_context._get_approval_timeout())
+            except Exception:
+                seconds = 300
+        entry.deadline = max(entry.deadline, time.monotonic()) + seconds
+        entry.extend_count += 1
+        taps, deadline = entry.extend_count, entry.deadline
+    logger.info("Approval extended by %ss (request_id=%s, session=%s, tap=%d, deadline_in=%ds)",
+                seconds, request_id, session_key, taps, max(0, int(deadline - time.monotonic())))
+    return 1
 
 
 def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> bool:
