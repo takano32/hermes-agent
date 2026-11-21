@@ -25,8 +25,8 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("authority", "cancelled", "card_deny_only", "data", "event", "expired", "identity", "observers",
-                 "owner", "reason", "result", "settle")
+    __slots__ = ("authority", "cancelled", "card_deny_only", "data", "deadline", "event", "expired", "extend_count",
+                 "identity", "observers", "owner", "reason", "result", "settle")
 
     def __init__(self, data: dict):
         self.owner = None
@@ -54,6 +54,11 @@ class _ApprovalEntry:
         self.cancelled: str | None = None
         # The prompt timed out unanswered; followers woken by its event adopt that timeout.
         self.expired = False
+        # Absolute (monotonic) moment this wait gives up, plus how many times a human has pushed it
+        # back. Set by the waiter; ``extend_gateway_approval()`` (approval card's 延長 button) only
+        # ever moves it later, so the card can keep the turn parked without changing approvals.timeout.
+        self.deadline: float | None = None
+        self.extend_count = 0
 
 
 def _identity_digest(text) -> str:
@@ -70,7 +75,7 @@ def _same_answerers(leader: dict, follower: dict) -> bool:
 
 
 def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str,
-                timeout_s: int | None = None) -> str:
+                timeout_s: int | None = None, deadline_getter=None) -> str:
     """Wait on *event* until it fires, the turn is interrupted, or approvals.timeout
     elapses; returns ``"set"`` | ``"interrupted"`` | ``"timeout"``. Polls in ~1s
     slices so activity heartbeats reach the agent's inactivity tracker every ~10s —
@@ -93,6 +98,15 @@ def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str,
             if is_interrupted():
                 logger.info(interrupt_log, session_key)
                 return "interrupted"
+            if deadline_getter is not None:
+                # A card tap may have pushed the deadline out (extend_gateway_approval): read it every
+                # slice so the extension is honoured mid-wait instead of only after a restart.
+                try:
+                    bumped = deadline_getter()
+                except Exception:
+                    bumped = None
+                if bumped is not None and bumped > deadline:
+                    deadline = bumped
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return "timeout"
@@ -199,6 +213,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     # Captured before the entry is published: a coalesced follower can find it while the pre-request
     # hooks still run, and must wait this same timeout rather than re-read a since-edited config.
     timeout_s = entry.data["timeout_s"] = _ctx._get_approval_timeout()
+    entry.deadline = time.monotonic() + max(timeout_s, 0)
 
     def _enqueue() -> None:
         register_prepared_approval(session_key, entry)
@@ -284,6 +299,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             return {"resolved": False, "choice": None, "notify_failed": True}
 
         state = _poll_event(entry.event, session_key, timeout_s=timeout_s,
+                            deadline_getter=lambda: entry.deadline,
                             interrupt_log="Approval wait interrupted — returning deny for session %s")
         cancelled = _cancel_cause(state, entry)
         if state == "interrupted":

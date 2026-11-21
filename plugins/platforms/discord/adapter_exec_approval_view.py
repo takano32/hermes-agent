@@ -25,7 +25,13 @@ def build_exec_approval_view(discord, base, *, unauthorized):
             allow_permanent: bool = True, allow_session: bool = True, smart_denied: bool = False,
             request_id: Optional[str] = None, allow_once: bool = True, approval_extra: Optional[dict] = None,
         ):
-            super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
+            # The CARD must outlive the backend wait: the approval waiter owns the deadline now
+            # (``_ApprovalEntry.deadline``, extendable by the 延長 button) and its settle observer
+            # retires this card when the request resolves, times out, or is withdrawn
+            # (``_observe_exec_approval_settle``). A card with no request id cannot be retired by the
+            # observer, so that fallback keeps its own view timeout as before.
+            super().__init__(allowed_user_ids, allowed_role_ids,
+                             timeout=None if request_id else _read_discord_prompt_timeout())
             self.session_key = session_key
             self.request_id = request_id
             self.pending_retire: Optional[str] = None  # settle reason that arrived before the card was sent
@@ -37,7 +43,8 @@ def build_exec_approval_view(discord, base, *, unauthorized):
             self.approval_extra = approval_extra
             self._localize_buttons(
                 allow_once="gateway.exec_approval.action_once", allow_session="gateway.exec_approval.action_session",
-                allow_always="gateway.exec_approval.action_always", deny="gateway.exec_approval.action_deny")
+                allow_always="gateway.exec_approval.action_always", deny="gateway.exec_approval.action_deny",
+                extend="platform.discord.approval.extend_button")
             if smart_denied or not allow_session:
                 self.remove_item(self.allow_session)
                 self.remove_item(self.allow_always)
@@ -167,5 +174,36 @@ def build_exec_approval_view(discord, base, *, unauthorized):
         @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
         async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
             await self._resolve(interaction, "deny", discord.Color.red(), "platform.discord.approval.resolved_deny")
+
+        @discord.ui.button(label="Extend 1h", style=discord.ButtonStyle.secondary)
+        async def extend(self, interaction: discord.Interaction, button: discord.ui.Button):
+            """Push the backend deadline out by one approvals.timeout window.
+
+            The card carries no view timeout (the backend wait is what expires it), so this is the way
+            to keep a turn parked when the human needs longer than ``approvals.timeout``. Only someone
+            who may answer the approval may extend it, and the wait reports "no longer pending" when the
+            request already settled or the tap cap is hit.
+            """
+            if not await self._gate(
+                interaction, resolved_msg=t("platform.discord.approval.already_resolved"),
+                unauth_msg=unauthorized(),
+            ):
+                return
+            from gateway.approval_actor import approval_refusal, refusal_text
+            if requester := approval_refusal(self.session_key, getattr(interaction.user, "id", ""),
+                                             extra=self.approval_extra or {}, request_id=self.request_id,
+                                             choice="once"):
+                return await interaction.response.send_message(refusal_text(requester), ephemeral=True)
+            from tools.approval import extend_gateway_approval
+            try:
+                count = extend_gateway_approval(self.session_key, self.request_id, 0)
+            except Exception as exc:
+                logger.error("Failed to extend gateway approval from button: %s", exc, exc_info=True)
+                count = 0
+            key = "platform.discord.approval.extended" if count else "platform.discord.approval.extend_failed"
+            try:
+                await interaction.response.send_message(t(key), ephemeral=True)
+            except Exception:
+                logger.debug("extend notice failed", exc_info=True)
 
     return ExecApprovalView
